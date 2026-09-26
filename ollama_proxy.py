@@ -104,5 +104,5 @@ if __name__ == "__main__":
     a = ap.parse_args()
     H.ollama = a.ollama
     H.model = a.model
-    print(f"ha-ollama-bridge on :{a.port} -> {a.ollama} ({a.model})")
+    print(f"ha-local-bridge on :{a.port} -> {a.ollama} ({a.model})")
     HTTPServer(("127.0.0.1", a.port), H).serve_forever()
