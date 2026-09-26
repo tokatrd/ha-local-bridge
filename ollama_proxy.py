@@ -1,6 +1,11 @@
-"""Ollama -> HA intent bridge. Stdlib only. Works offline via keyword fallback."""
+"""Ollama -> Home Assistant intent bridge. Stdlib only.
 
-import argparse, json, re, urllib.request
+Fast path: 6 common phrasings are answered locally without calling the model.
+Everything else is forwarded to Ollama and returned in an OpenAI-compatible
+envelope. If Ollama is down you get a plain-text fallback, never a traceback.
+"""
+
+import argparse, json, re, time, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 INTENTS = [
@@ -12,6 +17,8 @@ INTENTS = [
     (re.compile(r"close (.+)"), "cover.close_cover"),
 ]
 
+FALLBACK = "Local model unavailable — try a simple command like 'turn on …'."
+
 
 def keyword_parse(text):
     t = text.strip().lower()
@@ -19,14 +26,21 @@ def keyword_parse(text):
         m = pat.search(t)
         if m:
             return {"service": service, "entity": m.group(1).strip().replace(" ", "_")}
-    return {
-        "service": "conversation.reply",
-        "entity": None,
-        "reply": "No intent matched; forwarded to LLM.",
-    }
+    return None
 
 
-def ollama_chat(ollama_base, model, prompt, timeout=20):
+def extract_json(text):
+    """Pull the first {...} block out of model prose; None if there isn't one."""
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def ollama_chat(ollama_base, model, prompt, timeout=60):
     body = json.dumps(
         {
             "model": model,
@@ -39,21 +53,35 @@ def ollama_chat(ollama_base, model, prompt, timeout=20):
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode()).get("message", {}).get("content", "")
-    except Exception as e:
-        return f"__OLLAMA_DOWN__: {e}"
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode()).get("message", {}).get("content", "")
 
 
-SYSTEM = 'You control Home Assistant. Reply with ONLY JSON: {"service": "domain.service", "entity": "friendly_name_snake"}.'
+SYSTEM = (
+    "You control Home Assistant. Reply with ONLY this JSON, no other text: "
+    '{"service": "domain.service", "entity": "area_or_device_name"}'
+)
 
 
 class H(BaseHTTPRequestHandler):
     ollama = "http://localhost:11434"
     model = "llama3.1:8b"
 
-    def _send(self, obj, code=200):
+    def _send(self, content, cid, code=200):
+        obj = {
+            "id": cid,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
         b = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -61,36 +89,37 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def do_GET(self):
+        self.send_response(404)
+        self.end_headers()
+
     def do_POST(self):
+        if self.path.split("?")[0] != "/v1/chat/completions":
+            self.send_response(404)
+            self.end_headers()
+            return
         n = int(self.headers.get("Content-Length", 0))
         try:
             payload = json.loads(self.rfile.read(n) or b"{}")
-        except Exception:
+        except json.JSONDecodeError:
             payload = {}
         msgs = payload.get("messages", [])
         user_text = next(
             (m.get("content", "") for m in reversed(msgs) if m.get("role") == "user"),
             "",
         )
+
         local = keyword_parse(user_text)
-        if local["service"] != "conversation.reply":
-            return self._send(
-                {
-                    "id": "local",
-                    "object": "chat.completion",
-                    "choices": [
-                        {"message": {"role": "assistant", "content": json.dumps(local)}}
-                    ],
-                }
-            )
-        llm = ollama_chat(self.ollama, self.model, SYSTEM + "\nUser: " + user_text)
-        return self._send(
-            {
-                "id": "ollama",
-                "object": "chat.completion",
-                "choices": [{"message": {"role": "assistant", "content": llm}}],
-            }
-        )
+        if local is not None:
+            return self._send(json.dumps(local), "local")
+
+        try:
+            llm = ollama_chat(self.ollama, self.model, SYSTEM + "\nUser: " + user_text)
+        except Exception:
+            return self._send(FALLBACK, "fallback")
+
+        parsed = extract_json(llm)
+        return self._send(json.dumps(parsed) if parsed is not None else llm, "ollama")
 
     def log_message(self, format, *args):
         pass
@@ -98,11 +127,21 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ollama", default="http://localhost:11434")
-    ap.add_argument("--model", default="llama3.1:8b")
+    ap.add_argument(
+        "--ollama",
+        default="http://localhost:11434",
+        help="Ollama base URL (use http://<lan-ip>:11434 if HA/proxy are on different machines)",
+    )
+    ap.add_argument(
+        "--model",
+        default="llama3.1:8b",
+        help="model must already be pulled: ollama pull <model>",
+    )
+    ap.add_argument(
+        "--host", default="127.0.0.1", help="bind address; 0.0.0.0 to reach it over LAN"
+    )
     ap.add_argument("--port", type=int, default=8099)
     a = ap.parse_args()
-    H.ollama = a.ollama
-    H.model = a.model
-    print(f"ha-local-bridge on :{a.port} -> {a.ollama} ({a.model})")
-    HTTPServer(("127.0.0.1", a.port), H).serve_forever()
+    H.ollama, H.model = a.ollama, a.model
+    print(f"ha-local-bridge on {a.host}:{a.port} -> {a.ollama} ({a.model})")
+    HTTPServer((a.host, a.port), H).serve_forever()

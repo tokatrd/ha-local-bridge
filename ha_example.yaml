@@ -1,0 +1,22 @@
+# Example: consume the bridge from a Home Assistant script.
+#
+# The bridge returns chat text that is JSON like
+#   {"service": "light.turn_on", "entity": "kitchen_light"}
+# This script parses it and calls the service. Map the guessed name to a
+# real entity_id however fits your house (areas, labels, a lookup table).
+alias: LLM bridge command
+fields:
+  command:
+    description: What you said
+    example: turn on kitchen light
+sequence:
+  - service: conversation.process
+    data:
+      agent_id: conversation.openai_conversation
+      text: "{{ command }}"
+    response_variable: llm
+  - variables:
+      parsed: "{{ (llm.response.speech.plain | from_json) }}"
+  - service: homeassistant.toggle
+    target:
+      label_id: "{{ parsed.entity }}"
